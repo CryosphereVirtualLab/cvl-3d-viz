@@ -165,16 +165,23 @@ class DataConnectionManager:
         self.next_id += 1
     
     def remove_connection(self, conn):
-        del self.connections[conn.address]
+        try:
+            del self.connections[conn.address]
+        except:
+            traceback.print_exc()
         self.clean_queries()
     
     def post(self, notification):
         data = json.dumps(notification)
+        to_remove = []
         for addr, conn in self.connections.items():
             try:
                 conn.sendMessage(data)
             except:
+                to_remove.append(conn)
                 traceback.print_exc()
+        for conn in to_remove:
+            self.remove_connection(conn)
     
     def update(self, key, metadata=None, data=None):
         notification = { "key" : key,
@@ -246,6 +253,10 @@ class DataConnectionManager:
 manager = None
     
 class WebHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args):
+        self.lock = threading.Lock()
+        BaseHTTPRequestHandler.__init__(self, *args)
+    
     def send_mime(self, response, mimetype, code=200):
         self.send_response(code)
         self.send_header("Content-Type", mimetype)
@@ -303,12 +314,46 @@ class WebHandler(BaseHTTPRequestHandler):
                     self.send_404()
             elif comps[0] == "list":
                 self.send_json(json.dumps(list(filter(lambda x: manager.objects[x].metadata != None, manager.objects.keys()))))
+            elif comps[0] == "events":
+                self.enter_event_mode()
             else:
                 self.send_404()
         except:
             traceback.print_exc()
             self.send_404()
-        
+    
+    def enter_event_mode(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.flush()
+        self.address = self.client_address
+        manager.add_connection(self)
+    
+    def sendMessage(self, msg):
+        with self.lock:
+            #print(f"Sending: {msg}")
+            for line in msg.split("\n"):
+                to_send = "data: " + line + "\n"
+                #print(f"  {to_send}")
+                self.wfile.write(to_send.encode("utf-8"))
+            self.wfile.write("\n\n".encode("utf-8"))
+            self.wfile.flush()
+    
+    def do_OPTIONS(self):
+        # Here to handle CORS. So we basically say everything is ok, then
+        # let the browser go ahead and do the real post.
+        self.send_response(204)
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept")
+        self.send_header("Allow", "OPTIONS, GET, POST")
+        self.end_headers()
+        self.wfile.flush()
+    
     def do_POST(self):
         global manager
         if manager.read_only:
@@ -336,6 +381,9 @@ class WebHandler(BaseHTTPRequestHandler):
             elif operation == "query":
                 responses = manager.query()
                 result = responses.wait_for_responses()
+                self.send_json(json.dumps(result))
+            elif operation == "state":
+                manager.handle(self, post_data)
                 self.send_json(json.dumps(result))
             else:
                 self.send_404()
