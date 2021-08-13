@@ -5,8 +5,9 @@ import time
 import sys
 import traceback
 import threading
+import queue
 import io
-from SimpleWebSocketServer import SimpleWebSocketServer, WebSocket
+import stat
 from http.server import BaseHTTPRequestHandler
 try:
     from http.server import ThreadingHTTPServer
@@ -16,8 +17,11 @@ except:
     class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
         daemon = True
         daemon_threads = True
+import ssl
 from urllib.parse import urlparse, parse_qs
 import argparse
+from timeseries_db import tsdb
+import gzip
 
 class CVLObject:
     def __init__(self, key, id):
@@ -93,6 +97,7 @@ class QueryResponses:
 
 class DataConnectionManager:
     def __init__(self, options):
+        self.timeseries_paths = options.timeseries
         self.connections = {}
         self.objects = {}
         self.next_id = 1
@@ -100,6 +105,7 @@ class DataConnectionManager:
         self.queries = []
         self.persist_path = options.persist
         self.lock = threading.Lock()
+        self.op_queue = queue.Queue()
         self.read_only = options.read_only
         if options.persist is None:
             print("Server is running in transient mode - any objects created will be lost on server exit.")
@@ -112,14 +118,55 @@ class DataConnectionManager:
                 self.persist_path = None
         if self.persist_path is not None:
             self.load_objects()
-        self.base_port = options.base_port
+        self.port = options.port
         host = "localhost"
         if options.any:
         	host = "0.0.0.0"
-        self.ws_server = SimpleWebSocketServer(host, self.base_port + 1, WebSocketHandler)
-        self.http_server = ThreadingHTTPServer((host, self.base_port), WebHandler)
-        self.ws_thread = self.start(self.ws_server.serveforever)
+        ssl_context = None
+        if options.ssl and options.cert and options.key:
+            ssl_context = ssl.SSLContext()
+            ssl_context.check_hostname = False
+            ssl_context.load_cert_chain(certfile=options.cert, keyfile=options.key)
+        self.http_server = ThreadingHTTPServer((host, self.port), WebHandler)
+        if ssl_context != None:
+            self.http_server.socket = ssl_context.wrap_socket(self.http_server.socket, server_side=True)
+            print("SSL enabled")
         self.http_thread = self.start(self.http_server.serve_forever)
+        self.op_thread = self.start(self.op_queue_thread)
+        
+    def get_timeseries_databases(self):
+        thread_locals = threading.local()
+        try:
+            return thread_locals.timeseries
+        except:
+            thread_locals.timeseries = []
+            if len(options.timeseries) > 0:
+                for db in self.timeseries_paths:
+                    thread_locals.timeseries.append(tsdb(db))
+        return thread_locals.timeseries
+        
+    
+    def handle_timeseries_query(self, qs):
+        events = []
+        t0 = float(qs["t0"][0]) if "t0" in qs else float(qs["startts"][0])
+        t1 = float(qs["t1"][0]) if "t1" in qs else float(qs["endts"][0])
+        for db in self.get_timeseries_databases():
+            items = db.get(t0, t1)
+            for item in items:
+                ts, modified, path, type, content = item
+                if path is None:
+                    path = f"{db.name}/{ts}"
+                # Would be nice if we could avoid deserializing the json, just to serialize it again shortly.
+                events.append({"ts": ts, "db" : db.name, "path" : path, "type" : type, "content" : json.loads(content)})
+        return events
+    
+    def handle_info_query(self):
+        props = []
+        for db in self.get_timeseries_databases():
+            ts_props = json.loads(db.get_properties())
+            ts_props["db"] = db.name
+            props.append(ts_props)
+        return props
     
     def load_objects(self):
         files = os.listdir(self.persist_path)
@@ -156,7 +203,33 @@ class DataConnectionManager:
         thread.start()
         return thread
     
-    def add_connection(self, conn):
+    def op_queue_thread(self):
+        while True:
+            try:
+                op = self.op_queue.get(block=True, timeout=0.5)
+                if op["name"] == "add_connection":
+                    self._add_connection(op["data"])
+                elif op["name"] == "remove_connection":
+                    self._remove_connection(op["data"])
+                elif op["name"] == "post":
+                    self._post(op["data"])
+                elif op["name"] == "update":
+                    self._update(op["data"]["key"], op["data"]["metadata"], op["data"]["data"])
+                elif op["name"] == "msg":
+                    self._handle_msg(op["data"]["conn"], op["data"]["data"])
+                elif op["name"] == "add_query":
+                    self.queries.append(op["data"])
+                elif op["name"] == "clean_queries":
+                    self._clean_queries()
+                else:
+                    print(f"Unrecognized op: {op['name']}")
+            except queue.Empty:
+                pass
+    
+    def create_op(self, name, data):
+        return { "name" : name, "data" : data }
+    
+    def _add_connection(self, conn):
         self.connections[conn.address] = conn
         id_message = { "key" : self.next_id,
                        "operation" : "id",
@@ -164,15 +237,14 @@ class DataConnectionManager:
         conn.sendMessage(json.dumps(id_message))
         self.next_id += 1
     
-    def remove_connection(self, conn):
+    def _remove_connection(self, conn):
         try:
             del self.connections[conn.address]
         except:
             traceback.print_exc()
-        self.clean_queries()
-    
-    def post(self, notification):
-        data = json.dumps(notification)
+        self._clean_queries()
+
+    def _post(self, data):
         to_remove = []
         for addr, conn in self.connections.items():
             try:
@@ -181,42 +253,55 @@ class DataConnectionManager:
                 to_remove.append(conn)
                 traceback.print_exc()
         for conn in to_remove:
-            self.remove_connection(conn)
+            self._remove_connection(conn)
+    
+    def add_connection(self, conn):
+        self.op_queue.put(self.create_op("add_connection", conn))
+    
+    def remove_connection(self, conn):
+        self.op_queue.put(self.create_op("remove_connection", conn))
+    
+    def post(self, notification):
+        data = json.dumps(notification)
+        self.op_queue.put(self.create_op("post", data))
     
     def update(self, key, metadata=None, data=None):
-        notification = { "key" : key,
-                         "operation" : None,
-                         "meta" : None }
         if self.read_only:
             print("Read-only, ignoring update")
             return
-        with self.lock:
-            if metadata is None and data is None:
-                # Delete the key
-                notification["operation"] = "delete"
-                if key in self.objects:
-                    self.objects[key].purge(self.persist_path)
-                    del self.objects[key]
-                self.post(notification)
-                return
-            notification["operation"] = "update"
-            if key not in self.objects:
-                self.objects[key] = CVLObject(key, self.next_object_id)
-                self.next_object_id += 1
+        data = { "key" : key, "metadata" : metadata, "data" : data }
+        self.op_queue.put(self.create_op("update", data))
+    
+    def _update(self, key, metadata=None, data=None):
+        notification = { "key" : key,
+                         "operation" : None,
+                         "meta" : None }
+        if metadata is None and data is None:
+            # Delete the key
+            notification["operation"] = "delete"
+            if key in self.objects:
+                self.objects[key].purge(self.persist_path)
+                del self.objects[key]
+            self.post(notification)
+            return
+        notification["operation"] = "update"
+        if key not in self.objects:
+            self.objects[key] = CVLObject(key, self.next_object_id)
+            self.next_object_id += 1
         object = self.objects[key]
-        with object.lock:
-            if metadata is not None:
-                object.metadata = metadata
-            if data is not None:
-                object.data = data
-                object.last_data = time.time()
-                object.data_dirty = True
-            object.update_metadata()
-            if self.persist_path is not None:
-                object.persist(self.persist_path)
-            # Only post notifications once an object has valid metadata.
-            if object.metadata != None:
-                self.post(notification)
+        # TODO: Use object.lock here? Shouldn't be necessary, everything is serialized through op_queue
+        if metadata is not None:
+            object.metadata = metadata
+        if data is not None:
+            object.data = data
+            object.last_data = time.time()
+            object.data_dirty = True
+        object.update_metadata()
+        if self.persist_path is not None:
+            object.persist(self.persist_path)
+        # Only post notifications once an object has valid metadata.
+        if object.metadata != None:
+            self.post(notification)
     
     def control(self, metadata):
         notification = { "key" : None,
@@ -228,20 +313,30 @@ class DataConnectionManager:
         notification = { "key" : None,
                          "operation" : "query",
                          "meta" : None }
-        self.clean_queries()
         responses = QueryResponses(len(self.connections))
-        self.queries.append(responses)
+        self.clean_queries()
+        self.add_query(responses)
         self.post(notification)
         return responses
     
     def handle(self, conn, data):
+        msg = { "conn" : conn, "data" : data }
+        self.op_queue.put(self.create_op("msg", msg))
+    
+    def add_query(self, query):
+        self.op_queue.put(self.create_op("add_query", query))
+    
+    def clean_queries(self):
+        self.op_queue.put(self.create_op("clean_queries", None))
+    
+    def _handle_msg(self, conn, data):
         for q in self.queries:
             if q.add_response(conn, data):
                 return
         print(f"Got unhandled message from {conn}: {data}")
-        self.clean_queries()
+        self._clean_queries()
     
-    def clean_queries(self):
+    def _clean_queries(self):
         if len(self.queries) > 0:
             to_erase = []
             for q in self.queries:
@@ -260,12 +355,22 @@ class WebHandler(BaseHTTPRequestHandler):
     def send_mime(self, response, mimetype, code=200):
         self.send_response(code)
         self.send_header("Content-Type", mimetype)
+        if len(response) > 1024 and "Accept-Encoding" in self.headers and "gzip" in self.headers["Accept-Encoding"]:
+            compressed = self.compress(response)
+            if compressed is not None:
+                response = compressed
+                self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(response)))
         self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         if len(response) > 0:
             self.wfile.write(response)
+    
+    def compress(self, response):
+        compressed = gzip.compress(response)
+        if len(compressed) < len(response):
+            return compressed
     
     def send_json(self, response):
         self.send_mime(bytes(response, encoding="utf-8"), "application/json")
@@ -274,7 +379,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_mime(bytes("Not found", encoding="utf-8"), "text/plain", 404)
     
     def load_data(self):
-        content_length	= int(self.headers['Content-Length'])
+        content_length	= int(self.headers["Content-Length"])
         data			= self.rfile.read(content_length)
         return data
     
@@ -316,6 +421,13 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json(json.dumps(list(filter(lambda x: manager.objects[x].metadata != None, manager.objects.keys()))))
             elif comps[0] == "events":
                 self.enter_event_mode()
+            elif comps[0] == "ts":
+                self.send_json(json.dumps(manager.handle_timeseries_query(qs)))
+            elif comps[0] == "info":
+                self.send_json(json.dumps(manager.handle_info_query()))
+            elif comps[0] == "trust":
+                response = "Congratulations, you have successfully trusted the server's self-signed certificate! You may now close this tab."
+                self.send_mime(bytes(response, encoding="utf-8"), "text/plain", 200)
             else:
                 self.send_404()
         except:
@@ -412,34 +524,35 @@ class WebHandler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.send_404()
 
-class WebSocketHandler(WebSocket):
-    def handleMessage(self):
-        try:
-            data = json.loads(self.data)
-            manager.handle(self, data)
-        except:
-            traceback.print_exc()
-    
-    def handleConnected(self):
-        print(f"+ Connect {self.address}")
-        manager.add_connection(self)
-    
-    def handleClose(self):
-        print(f"- Closing {self.address}")
-        manager.remove_connection(self)
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CVL Object Server")
     parser.add_argument("--read-only", default=False, action="store_true", help="Run in read-only mode")
     parser.add_argument("--persist", default=None, action="store", help="Path to directory where objects will be stored. If not specified, objects disappear when the server restarts.")
-    parser.add_argument("--base-port", default = 3193, type=int, help="Base port number for web server. Web sockets use the given port number + 1.")
+    parser.add_argument("--port", default=3193, type=int, help="Port number the web server will listen on")
     parser.add_argument("--any", default=False, action="store_true", help="Allow connections from any interface")
+    parser.add_argument("--timeseries", nargs="*", default=[], help="Timeseries databases to serve data from")
+    parser.add_argument("--ssl", default=True, action=argparse.BooleanOptionalAction, help="Enable SSL support")
+    parser.add_argument("--cert", default="cert.pem", help="Path to certificate file for SSL")
+    parser.add_argument("--key", default="key.pem", help="Path to private key file for SSL")
     options = parser.parse_args()
+    if options.ssl:
+        try:
+            s = os.stat(options.cert)
+            s = os.stat(options.key)
+        except:
+            print("SSL is enabled by default, but no certificate or key has been configured. Use --no-ssl to disable SSL.")
+            print("To generate a self-signed certificate for localhost, execute the following command:\n")
+            
+            print("  openssl req -x509 -nodes -days 730 -newkey rsa:2048 -keyout key.pem -out cert.pem -config localhost-ssl.conf\n")
+            
+            print("Alternately, edit the localhost-ssl.conf file to generate a self-signed certificate for a different hostname/IP")
+            print("address, and run the command above. You will also need to configure your web browser to trust the self-signed")
+            print("certificate.")
+            raise SystemExit
     manager = DataConnectionManager(options)
     try:
         while True:
             time.sleep(10)
     except:
-        manager.ws_server.close()
         raise SystemExit
 

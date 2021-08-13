@@ -12,6 +12,11 @@ import threading
 import queue
 import time
 import json
+import urllib3
+
+# We are not going to verify certificates, and will typically connect to servers
+# with self-signed certs.
+urllib3.disable_warnings()
 
 #import logging
 #logging.basicConfig(level=logging.DEBUG)
@@ -394,7 +399,8 @@ class viz:
             method = session.post
         elif item["method"] == "put":
             method = session.put
-        r = method(item["url"], headers=item["headers"], json=item["json"], data=item["data"])
+        # Punt on accepting self-signed certificates.
+        r = method(item["url"], headers=item["headers"], json=item["json"], data=item["data"], verify=False)
         if r.status_code != requests.codes.ok:
             try:
                 r.raise_for_status()
