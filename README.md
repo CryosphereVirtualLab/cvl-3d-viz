@@ -21,11 +21,18 @@ The server defaults to storing all posted data in memory. Even though you typica
 
 The server supports the following command line arguments:
 
-
+- `--read-only` Run the server in read-only mode. Only makes sense if you need to serve timeseries databases or a previously persisted collection of objects.
+- `--persist <path>` Persist the objects published to the server to files in the directory specified by `<path>`.
+- `--port <number>` Run the server on a different port
+- `--any` Listen on all interfaces, not just localhost
+- `--timeseries <db1> [db2 ...]` Make the specified timeseries databases available through this server
+- `--no-ssl` Run the server without SSL. If you do this, you must view the CVL 3D globe without SSL (e.g, http, not https) as well.
+- `--cert <path>` Path to the certificate to use for SSL.
+- `--key <path>` Path to the private key to use for SSL.
 
 ## Visualizing data
 
-This repository contains a Jupyter notebook called `notebooks/Examples.ipynb` which demonstrates how to create and post graphical objects to the CVL server. First, open the notebook:
+This repository contains a Jupyter notebook called `notebooks/Examples.ipynb` which demonstrates how to create and post graphical objects to the CVL server. First, make sure you have started the CVL server, and that it is running on your local computer. Next, open the notebook:
 
 	jupyter notebook notebooks/Examples.ipynb
 
@@ -34,15 +41,4 @@ Next, open the CVL website in a new window: [https://cvl.eo.esa.int](https://cvl
 At this point, execute each cell of the Examples notebook in turn, and observe as new elements get added to the visualization in the browser window containing the CVL 3D globe.
 
 ![img/examples.jpg](img/examples.jpg)
-
-
-
-Quickstart:
-
-1. Start an instance of the CVL server:
-	- `python3 cvl/server.py`
-2. Start the Examples notebook
-	- ```jupyter notebook notebooks/Examples.ipynb```
-3. Open the CVL website: [https://cvl.eo.esa.int](https://cvl.eo.esa.int)
-4. Execute each cell of the notebook in turn, and observe as new elements get added to the visualization in the browser tab containing the CVL 3D visualization
 
