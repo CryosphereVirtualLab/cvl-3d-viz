@@ -223,7 +223,7 @@ class Raster:
         
     
 class viz:
-    def __init__(self, server="localhost", port=3193, proto="http://", threaded=True, num_threads=4):
+    def __init__(self, server="localhost", port=3193, proto="https://", threaded=True, num_threads=4):
         self.server = server
         self.port = port
         self.proto = proto
