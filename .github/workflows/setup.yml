@@ -1,0 +1,30 @@
+name: test packaging
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+
+  install:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Install Conda environment from environment.yml
+      uses: mamba-org/provision-with-micromamba@main
+    - name: Check installation
+      shell: bash -l {0}
+      run: |
+        python -c "from osgeo import gdal"
+    - name: Install CVL package
+      shell: bash -l {0}
+      run: |
+        python setup.py install
+    - name: Install CVL package
+      shell: bash -l {0}
+      run: |
+        python -c "from cvl.viz import viz"
